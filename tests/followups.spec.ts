@@ -4,6 +4,9 @@ import { CHAT, feishu, startRuntime, type Host } from './fixtures/host.ts'
 import { repliedTo } from '../src/app/links.ts'
 import { inputMessage } from '../src/executor/dsh.ts'
 
+// Every test starts a full Runtime; the default 5s timeout flakes under a parallel full-suite run (observed on WSL).
+vi.setConfig({ testTimeout: 30_000 })
+
 let h: Host | undefined
 afterEach(async () => { await h?.stop(); h = undefined })
 const THREAD = `feishu:${CHAT}:om_1`

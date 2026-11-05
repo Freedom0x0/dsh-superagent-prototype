@@ -10,7 +10,8 @@ import { runAsWorker, sameDirectory, withoutDirectory, workerBin } from './infra
 import { SetupError } from './setup.ts'
 
 const reason = (error: unknown): string => error instanceof Error ? error.message : String(error)
-const absolute = (description: string) => s.string().pattern(/^\//).description(`${description} Absolute path.`)
+/** Absolute path on either platform: Unix `/...` or Windows `X:\...`/`X:/...` (a leading `/` on Windows resolves under the current drive, which the state directory lock and every join below rely on path.resolve to normalize). */
+const absolute = (description: string) => s.string().pattern(/^(\/[^\0]*|[A-Za-z]:[/\\][^\0]*)$/).description(`${description} Absolute path.`)
 /** Plugin configuration of the dsh-superagent entry. Volatile fields apply without a restart because dsh-superagent reads them on each use; changing `stateDir` remounts the plugin. */
 export const Config = s.object({
   stateDir: absolute('Directory for the database, locks, worker shims, the agent\'s git configuration and, by default, the ticket directories.').required(),
@@ -57,10 +58,17 @@ export interface Deployment extends Machine {
 }
 export interface FeishuBot { cli: string; appId: string; brand: 'feishu' | 'lark'; botId: string; name: string }
 
+/** Windows resolves a bare command name against PATHEXT extensions (`.exe`, `.cmd`, …); POSIX runs the name as-is. */
+const EXTENSIONS = process.platform === 'win32'
+  ? (process.env.PATHEXT ?? '.EXE;.CMD;.BAT').split(';').filter(ext => ext.startsWith('.')).map(ext => ext.toLowerCase())
+  : ['']
 /** Resolve a command name or absolute path to an executable file, ignoring the worker shim directory. */
 export function executable(name: string, path: string, exclude?: string): string {
   if (name.includes('/') && !isAbsolute(name)) throw new Error(`${name} must be a command name or an absolute path`)
-  const candidates = isAbsolute(name) ? [name] : path.split(delimiter).filter(dir => isAbsolute(dir) && !(exclude && sameDirectory(dir, exclude))).map(dir => join(dir, name))
+  const directories = isAbsolute(name) ? [''] : path.split(delimiter).filter(dir => isAbsolute(dir) && !(exclude && sameDirectory(dir, exclude)))
+  const candidates = isAbsolute(name)
+    ? [name]
+    : directories.flatMap(dir => EXTENSIONS.map(ext => join(dir, ext ? `${name}${ext}` : name)))
   for (const candidate of candidates) {
     try { if (statSync(candidate).isFile()) { accessSync(candidate, constants.X_OK); return candidate } }
     catch { /* Not an executable file here; try the next PATH directory. */ }
@@ -69,10 +77,15 @@ export function executable(name: string, path: string, exclude?: string): string
 }
 
 export type Probe = (argv: string[]) => Promise<string>
-/** Run startup checks through DSH's worker subprocess service with worker shims removed from PATH so a `gh` wrapper script reaches the real binary. */
+/**
+ * Run startup checks through DSH's worker subprocess service with worker shims removed from PATH so a `gh` wrapper script reaches the real binary.
+ * POSIX reaches the scrubbed PATH through the `env` program; Windows has none, so the scrubbed PATH is passed as an explicit env override, which the subprocess seam merges after its credential scrub.
+ */
 export function workerProbe(subprocess: SubprocessRuntime, stateDir: string, cwd: string, signal: AbortSignal): Probe {
   const path = withoutDirectory(process.env.PATH ?? '', workerBin(stateDir))
-  return argv => runAsWorker(subprocess, ['env', `PATH=${path}`, ...argv], cwd, AbortSignal.any([signal, AbortSignal.timeout(60_000)]))
+  const timeout = AbortSignal.any([signal, AbortSignal.timeout(60_000)])
+  if (process.platform === 'win32') return argv => runAsWorker(subprocess, argv, cwd, timeout, { PATH: path })
+  return argv => runAsWorker(subprocess, ['env', `PATH=${path}`, ...argv], cwd, timeout)
 }
 
 const GithubUser = z.object({ login: z.string().regex(/^[A-Za-z0-9-]+$/), id: z.number().int().positive() })
